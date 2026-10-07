@@ -2096,6 +2096,8 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
+        } else if (!strcmp(arg, "--max-reasoning-tokens")) {
+            c.engine.reasoning_budget = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

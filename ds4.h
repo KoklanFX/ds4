@@ -144,6 +144,10 @@ typedef struct {
     float directional_steering_attn;
     float directional_steering_ffn;
     int power_percent;
+    int reasoning_budget;   /* Hard cap on reasoning tokens emitted before the
+                             * engine forces the think_end_id and continues with
+                             * the body.  0 = use the engine default (32000);
+                             * <= -1 = disabled. */
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_full_layers;
@@ -177,6 +181,16 @@ typedef struct {
     ds4_distributed_options distributed;
     ds4_tp_options tp;
 } ds4_engine_options;
+
+/* Outcome of a raw generation run.  reasoning_tokens_out reports how many of
+ * the emitted tokens were still inside a reasoning segment (i.e. before the
+ * first think_end_id was emitted); the engine caps this at reasoning_budget
+ * and then forces the think_end_id to release the body. */
+typedef struct {
+    int rc;
+    int n_generated;
+    int reasoning_tokens_out;
+} ds4_generate_result;
 
 typedef struct {
     float *data;
@@ -392,6 +406,7 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+int ds4_token_think_end(ds4_engine *e);
 
 /* Tensor-parallel binding: allocates the GPU gate slab, registers it with
  * the transport and arms the per-layer gate machinery.  Call once, after
@@ -475,6 +490,23 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+/* Tone-mask suppression: while enabled (think segment + sentence start), the
+ * listed vocabulary ids are hard-suppressed from every sampling path.  Used to
+ * strip reasoning filler like 嗯/好.  Ids must be non-negative; pass n=0 to
+ * disable. */
+#define DS4_TONE_MASK_MAX 16
+void ds4_tone_mask_set(const int ids[], int n);
+bool ds4_tone_mask_active(void);
+bool ds4_tone_mask_covers(int token);
+/* Repetition (frequency) penalty applied at the shared sampling layer.  While
+ * active with penalty > 0.0f, tokens that already appeared in the recent
+ * history window have their logits scaled down so the model cannot loop by
+ * repeating the same few tokens.  Default off (0.0f); wired from the server
+ * when repetition degeneration is detected. */
+void ds4_repeat_set(const int hist[], int n, int window, float penalty);
+bool ds4_repeat_active(void);
+void ds4_repeat_apply_freq(int n_vocab);
+int  ds4_repeat_count(int id);
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -580,6 +612,7 @@ void ds4_session_invalidate(ds4_session *s);
 bool ds4_session_rewind_speculative(ds4_session *s, int pos);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
+float *ds4_session_logits_ptr(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);

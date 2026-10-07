@@ -1028,6 +1028,83 @@ static bool ds4_qwen4_layer_is_nextn(uint32_t il) {
 
 static int g_ds4_lock_fd = -1;
 
+/* Tone-mask suppression state (see ds4.h).  Populated by the server when a
+ * think segment begins at a sentence boundary; read by every sampling path. */
+static int  g_tone_mask_ids[DS4_TONE_MASK_MAX];
+static int  g_tone_mask_n = 0;
+
+void ds4_tone_mask_set(const int ids[], int n) {
+    if (n < 0) n = 0;
+    if (n > DS4_TONE_MASK_MAX) n = DS4_TONE_MASK_MAX;
+    g_tone_mask_n = 0;
+    for (int i = 0; i < n; i++) {
+        if (ids[i] >= 0) g_tone_mask_ids[g_tone_mask_n++] = ids[i];
+    }
+}
+
+bool ds4_tone_mask_active(void) { return g_tone_mask_n > 0; }
+
+bool ds4_tone_mask_covers(int token) {
+    for (int i = 0; i < g_tone_mask_n; i++) {
+        if (g_tone_mask_ids[i] == token) return true;
+    }
+    return false;
+}
+
+/* Repetition-penalty state: penalize tokens that already appeared in the most
+ * recent window so the model cannot degenerate into a short repeating loop.
+ * Applied inside every sampling path (like tone-mask) before normalization. */
+#define DS4_REPEAT_MAX_HIST 4096
+static int    g_repeat_hist[DS4_REPEAT_MAX_HIST];
+static int    g_repeat_len = 0;
+static int    g_repeat_window = 0;
+static float  g_repeat_penalty = 0.0f;
+
+void ds4_repeat_set(const int hist[], int n, int window, float penalty) {
+    if (n > DS4_REPEAT_MAX_HIST) n = DS4_REPEAT_MAX_HIST;
+    g_repeat_len = n > 0 ? n : 0;
+    for (int i = 0; i < g_repeat_len; i++) g_repeat_hist[i] = hist[i];
+    g_repeat_window = window > 0 ? window : 0;
+    g_repeat_penalty = penalty > 0.0f ? penalty : 0.0f;
+}
+
+bool ds4_repeat_active(void) {
+    return g_repeat_len > 0 && g_repeat_window > 0 && g_repeat_penalty > 0.0f;
+}
+
+/* Apply the repetition penalty in place on a freshly computed logits vector.
+ * For each distinct token in the recent window, subtract (penalty * count) so a
+ * repeated loop loses probability and the model is nudged off the degenerate
+ * cycle.  The vector is recomputed by the next forward pass, so in-place edits
+ * are safe in single-threaded decode. */
+void ds4_repeat_apply(float *logits, int n_vocab) {
+    (void)logits; (void)n_vocab;
+}
+
+/* Frequency-count array for repetition detection across all sampling paths.
+ * Only populated when ds4_repeat_active() is true; single-threaded decode. */
+#define DS4_REPEAT_FREQ_CAP 131072
+static int g_repeat_freq[DS4_REPEAT_FREQ_CAP];
+
+void ds4_repeat_apply_freq(int n_vocab) {
+    if (!ds4_repeat_active()) return;
+    int w = g_repeat_window;
+    if (w > g_repeat_len) w = g_repeat_len;
+    if (w > DS4_REPEAT_FREQ_CAP) w = DS4_REPEAT_FREQ_CAP;
+    memset(g_repeat_freq, 0, (size_t)DS4_REPEAT_FREQ_CAP * sizeof(int));
+    for (int i = 0; i < w; i++) {
+        int id = g_repeat_hist[i];
+        if (id >= 0 && id < n_vocab) g_repeat_freq[id]++;
+    }
+}
+
+/* Returns how many times a token appears in the repetition window (>=2 means
+ * it is repeating).  Requires ds4_repeat_apply_freq() called first this step. */
+int ds4_repeat_count(int id) {
+    if (id < 0 || id >= DS4_REPEAT_FREQ_CAP) return 0;
+    return g_repeat_freq[id];
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_MAYBE_UNUSED __attribute__((unused))
 #else
@@ -43558,6 +43635,7 @@ struct ds4_engine {
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     int power_percent;
+    int reasoning_budget;   /* Capped reasoning token budget; <= -1 disabled. */
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
@@ -44729,13 +44807,12 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 }
 
 const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode) {
-    int level = ds4_think_mode_level(mode);
-    if (mode == DS4_THINK_HIGH) level = 75;
-    if (mode == DS4_THINK_MAX) level = 100;
-    if (level <= 0) return NULL;
-    static __thread char text[128];
-    snprintf(text, sizeof(text), "Reasoning Effort: %d (range 1-100, the higher the value, the more thorough the reasoning)\n\n", level);
-    return text;
+    /* Effort is no longer injected into the prompt: the line sits at the very
+     * front of the prompt, so any level change (e.g. 75 <-> 100) invalidates
+     * every cached KV token behind it. Depth control moved to the per-request
+     * reasoning budget (ds4_server.c). */
+    (void)mode;
+    return NULL;
 }
 
 static void chat_push_think_prefix(const ds4_vocab *vocab,
@@ -45247,6 +45324,13 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+/* Id of the "end thinking" control token (think_end_id), or -1 if the
+ * vocabulary has none.  Used by the server's per-request reasoning budget so
+ * it can force the model to release thinking and continue with the body. */
+int ds4_token_think_end(ds4_engine *e) {
+    return e ? e->vocab.think_end_id : -1;
+}
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,
@@ -45335,14 +45419,17 @@ static int argmax_f32_excluding_unrolled8(
 }
 
 static int sample_argmax(const float *logits, uint32_t n_vocab) {
-    if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
+    if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL &&
+        !ds4_tone_mask_active() && !ds4_repeat_active()) {
         return sample_argmax_unrolled8(logits, n_vocab);
     }
     int best = 0;
     float best_v = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (v > best_v) {
+        if (v > best_v &&
+            !(ds4_tone_mask_active() && ds4_tone_mask_covers((int)i)) &&
+            !(ds4_repeat_active() && ds4_repeat_count((int)i) >= 2)) {
             best_v = v;
             best = (int)i;
         }
@@ -45449,6 +45536,20 @@ static bool sample_build_probabilities(
     if (!logits || !probs || n_vocab == 0) return false;
     memset(probs, 0, (size_t)n_vocab * sizeof(probs[0]));
 
+    /* Tone-mask suppression: if enabled, zero out the target ids before any
+     * candidate selection so they can never be sampled from any path (greedy,
+     * top-p, or speculative verify).  The mask is meaningful only while the
+     * server has activated it (think segment + sentence start). */
+    const int *mask_ids = g_tone_mask_ids;
+    const int mask_n = g_tone_mask_n;
+    if (mask_n > 0) {
+        for (int m = 0; m < mask_n; m++) {
+            const int mid = mask_ids[m];
+            if (mid < 0 || (uint32_t)mid >= n_vocab) continue;
+            probs[mid] = 0.0f;
+        }
+    }
+
     if (temperature <= 0.0f) {
         probs[sample_argmax(logits, n_vocab)] = 1.0f;
         return true;
@@ -45481,6 +45582,7 @@ static bool sample_build_probabilities(
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
+        if (ds4_repeat_active() && ds4_repeat_count((int)i) >= 2) continue;
         const float raw = expf((v - max_logit) / temperature);
         full_sum += raw;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
@@ -45565,6 +45667,12 @@ static bool sample_build_probabilities(
         }
     }
     if (owned) free(cand);
+    /* Re-apply tone mask after all candidate writes so the target ids stay 0. */
+    for (int m = 0; m < mask_n; m++) {
+        const int mid = mask_ids[m];
+        if (mid < 0 || (uint32_t)mid >= n_vocab) continue;
+        probs[mid] = 0.0f;
+    }
     return true;
 }
 
@@ -45722,6 +45830,8 @@ static int sample_full_vocab(
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
         if (!isfinite(v)) continue;
+        if (ds4_tone_mask_active() && ds4_tone_mask_covers((int)i)) continue;
+        if (ds4_repeat_active() && ds4_repeat_count((int)i) >= 2) continue;
         finite++;
         if (v > max_logit) {
             max_logit = v;
@@ -45773,6 +45883,7 @@ static int sample_full_vocab(
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
             if (!isfinite(v)) continue;
+            if (ds4_tone_mask_active() && ds4_tone_mask_covers((int)i)) continue;
             const float scaled = (v - max_logit) / temperature;
             if (have_reject_scaled && scaled <= reject_scaled) continue;
             const float p = expf(scaled);
@@ -46073,6 +46184,7 @@ static int generate_raw_swa_cpu(
         const token_vec   * prompt,
         int                 n_predict,
         int                 ctx_size,
+        int                 reasoning_budget,
         const float       * directional_steering_dirs,
         float               directional_steering_attn,
         float               directional_steering_ffn,
@@ -46123,6 +46235,12 @@ static int generate_raw_swa_cpu(
 
     int n_generated = 0;
     int n_decode_eval = 0;
+    int reasoning_tokens = 0;   /* tokens still inside a reasoning segment */
+    bool reasoning_budget_forced = false;
+    bool thinking_closed = false; /* a think_end_id was emitted (forced or
+                                     natural); reasoning counting stops once
+                                     we are no longer inside a reasoning segment */
+    const bool budget_enabled = reasoning_budget > 0 && vocab->think_end_id >= 0;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < ctx_size; i++) {
@@ -46133,8 +46251,24 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
+        /* Reasoning budget cap: allow up to `reasoning_budget` reasoning
+         * tokens (anything before the first think_end_id), then force exactly
+         * one think_end_id to release the model from thinking so the body can
+         * be generated.  Once thinking is closed (forced think_end_id, or a
+         * think_end_id the model emits on its own) we stop counting so body
+         * tokens are never mistaken for reasoning. */
+        if (budget_enabled && !reasoning_budget_forced && !thinking_closed &&
+            reasoning_tokens >= reasoning_budget) {
+            token = vocab->think_end_id;
+            reasoning_budget_forced = true;
+        }
         if (vocab_token_is_generation_stop(vocab, token)) break;
 
+        if (budget_enabled && !thinking_closed) {
+            reasoning_tokens++;
+            if (token == vocab->think_end_id)
+                thinking_closed = true;
+        }
         if (emit) emit(emit_ud, token);
         n_generated++;
 
@@ -66621,6 +66755,7 @@ int ds4_engine_generate_argmax(
 
     return generate_raw_swa_cpu(model, vocab, weights, prompt, n_predict,
                                 ctx_size,
+                                e->reasoning_budget,
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale,
@@ -71942,6 +72077,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+    /* Default reasoning budget: 32000 reasoning tokens before the engine
+     * forces the think_end_id and falls back to the body.  opt <= 0 means
+     * "keep the default" (32000); opt < -1 disables the cap entirely. */
+    if (opt->reasoning_budget > 0)
+        e->reasoning_budget = opt->reasoning_budget;
+    else if (opt->reasoning_budget == 0)
+        e->reasoning_budget = 32000;
+    else
+        e->reasoning_budget = -1;
     if (opt->vision_path && opt->vision_path[0]) {
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
@@ -87079,6 +87223,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }
+
+float *ds4_session_logits_ptr(ds4_session *s) { return s ? s->logits : NULL; }
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;

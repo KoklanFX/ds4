@@ -355,6 +355,61 @@ static void check_speculative_distribution(void) {
 }
 
 int main(void) {
+    
+
+    /* Repetition penalty: a repeated token loses probability even if its
+     * raw logit is high.  Token 7 appears 3x in the window -> penalized. */
+    {
+        int hist[8]={0,7,1,7,2,7,3,4};
+        float lg[8];
+        for(int i=0;i<8;i++) lg[i]= (i==7)?2.0f:0.0f;  /* token7 highest raw */
+        float probs[8];
+        ds4_tone_mask_set(NULL,0);
+        /* no penalty: token7 wins */
+        ds4_repeat_set(NULL,0,0,0.0f);
+        CHECK(ds4_test_sampling_probabilities(lg,8,1.0f,0,1.0f,0.0f,probs)!=0,"no penalty build");
+        int argmax=0; for(int i=1;i<8;i++) if(probs[i]>probs[argmax]) argmax=i;
+        CHECK(argmax==7,"raw argmax is 7");
+        /* with penalty 3.0: apply to a copy then build */
+        ds4_repeat_set(hist,8,8,1.0f);
+        ds4_repeat_apply_freq(8);
+        /* excluded token 7 has count 3 in window -> skipped in all paths */
+        CHECK(ds4_test_sampling_probabilities(lg,8,1.0f,0,1.0f,0.0f,probs)!=0,"penalty build");
+        /* with penalty the repeated token should have zero probability */
+        float maxp=0.0f; int maxi=0;
+        for(int i=0;i<8;i++) if(probs[i]>maxp){maxp=probs[i];maxi=i;}
+        CHECK(probs[7]==0.0f,"repetition token fully excluded");
+        /* but non-repeated tokens retain mass */
+        CHECK(probs[maxi]>0.0f,"other tokens keep prob");
+        ds4_repeat_set(NULL,0,0,0.0f);
+    }
+    /* 已有测试 */
+
+    
+
+
+
+    /* Tone-mask: verify only the masked id is suppressed, and only while active. */
+    {
+        const float lg[] = { logf(0.10f), logf(0.40f), logf(0.30f), logf(0.20f) };
+        float probs[4];
+        /* inactive: nothing masked, sampled normally */
+        ds4_tone_mask_set(NULL, 0);
+        CHECK(ds4_test_sampling_probabilities(lg, 4, 1.0f, 0, 1.0f, 0.f, probs) != 0, "mask inactive build");
+        CHECK(probs[0] > 0.0f && probs[1] > 0.0f && probs[2] > 0.0f && probs[3] > 0.0f, "mask inactive keeps all");
+        /* active with id 1 (= index 1): that probability must be zero, others intact */
+        int ids[1] = { 1 };
+        ds4_tone_mask_set(ids, 1);
+        CHECK(ds4_test_sampling_probabilities(lg, 4, 1.0f, 0, 1.0f, 0.f, probs) != 0, "mask active build");
+        CHECK(probs[1] == 0.0f && probs[0] > 0.0f && probs[2] > 0.0f && probs[3] > 0.0f,
+              "mask suppresses only target token");
+        /* out-of-range id must not crash or mask anything else */
+        int bad[1] = { 1000000 };
+        ds4_tone_mask_set(bad, 1);
+        CHECK(ds4_test_sampling_probabilities(lg, 4, 1.0f, 0, 1.0f, 0.f, probs) != 0, "mask bad-id safe");
+        CHECK(probs[0] > 0.0f, "bad id leaves others alone");
+        ds4_tone_mask_set(NULL, 0);
+    }
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
@@ -566,3 +621,4 @@ int main(void) {
     puts("sampling tests: OK");
     return 0;
 }
+

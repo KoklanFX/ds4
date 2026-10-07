@@ -820,6 +820,13 @@ typedef struct {
     bool top_p_set;
     bool min_p_set;
     bool top_k_set;
+    /* Optional per-request hard cap on reasoning tokens (anything before the
+     * first think_end_id). 0/unset keeps the engine default (32000).  Set by
+     * the OpenAI-compatible request fields "reasoning_budget_tokens" and
+     * "max_reasoning_tokens".  generate_job applies it to the decode loop so
+     * the cap reaches the sampling step and any earlier sampling was reset. */
+    int reasoning_budget;
+    bool reasoning_budget_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -996,7 +1003,9 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = g_default_top_p;
     r->min_p = g_default_min_p;
-    r->think_mode = DS4_THINK_HIGH;
+    r->think_mode = DS4_THINK_MEDIUM;
+    r->reasoning_budget = 0;
+    r->reasoning_budget_set = false;
 }
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
@@ -1036,6 +1045,22 @@ static void request_free(request *r) {
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
     return effort;
+}
+
+/* Map a reasoning-effort level to a default per-request reasoning budget.
+ * With the effort line removed from the prompt (KV-prefix stability), depth
+ * control is enforced by the decode-loop budget: the model may still stop
+ * earlier on its own; the cap only fires when it rambles past the ceiling.
+ * Requests that carry an explicit reasoning_budget_tokens/max_reasoning_tokens
+ * keep their explicit value. */
+static int reasoning_budget_for_mode(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_MAX:    return 32000;
+    case DS4_THINK_HIGH:   return 24000;
+    case DS4_THINK_MEDIUM: return 20000;
+    case DS4_THINK_LOW:    return 8000;
+    default:               return 0;  /* NONE / numeric levels: no cap */
+    }
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
@@ -4193,6 +4218,18 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->top_k_set = true;
+        } else if (!strcmp(key, "reasoning_budget_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
+        } else if (!strcmp(key, "max_reasoning_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4270,6 +4307,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!r->reasoning_budget_set) {
+        r->reasoning_budget = reasoning_budget_for_mode(r->think_mode);
+        r->reasoning_budget_set = r->reasoning_budget > 0;
+    }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
@@ -4424,6 +4465,18 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->top_k_set = true;
+        } else if (!strcmp(key, "reasoning_budget_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
+        } else if (!strcmp(key, "max_reasoning_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4486,6 +4539,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!r->reasoning_budget_set) {
+        r->reasoning_budget = reasoning_budget_for_mode(r->think_mode);
+        r->reasoning_budget_set = r->reasoning_budget > 0;
+    }
     if (!anthropic_validate_tool_results(s, &msgs,
                                          &r->anthropic_requires_live_tool_state,
                                          err, errlen))
@@ -5515,6 +5572,10 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!r->reasoning_budget_set) {
+        r->reasoning_budget = reasoning_budget_for_mode(r->think_mode);
+        r->reasoning_budget_set = r->reasoning_budget > 0;
+    }
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -5663,6 +5724,18 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->top_k_set = true;
+        } else if (!strcmp(key, "reasoning_budget_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
+        } else if (!strcmp(key, "max_reasoning_tokens")) {
+            if (!json_int(&p, &r->reasoning_budget)) {
+                free(key);
+                goto bad;
+            }
+            r->reasoning_budget_set = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -5721,6 +5794,10 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!r->reasoning_budget_set) {
+        r->reasoning_budget = reasoning_budget_for_mode(r->think_mode);
+        r->reasoning_budget_set = r->reasoning_budget > 0;
+    }
     chat_msgs msgs = {0};
     chat_msg sys = {0};
     sys.role = xstrdup("system");
@@ -12116,6 +12193,24 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+/* True if the piece ends with a sentence/clause boundary character, i.e. the
+ * next generated token starts a fresh sentence (candidate for tone-mask). */
+static bool tone_mask_piece_begins_sentence(const char *p, size_t len) {
+    if (len == 0) return true;
+    /* scan back over trailing whitespace to the last visible char */
+    size_t n = len;
+    while (n > 0 && (unsigned char)p[n-1] == ' ') n--;
+    if (n == 0) return false;
+    /* simpler: check exact last bytes */
+    static const char *terms[] = {
+        "\u3002","\uff01","\uff1f","\uff1b","\uff0c","\uff09","\u3011","\n", NULL};
+    for (int i = 0; terms[i]; i++) {
+        size_t tl = strlen(terms[i]);
+        if (n >= tl && memcmp(p + n - tl, terms[i], tl) == 0) return true;
+    }
+    return false;
+}
+
 /* A completed tool block inside unclosed reasoning can be recovered without
  * predicting what the model will emit after an injected close marker. Keep a
  * short overlap until the opening appears, then wait for its matching end. */
@@ -13784,6 +13879,34 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
 
+    /* Per-request reasoning budget enforcement: mirrors the raw-generation
+     * cap in ds4_generate_raw_swa_cpu.  reasoning_tokens counts tokens emitted
+     * inside a reasoning segment; once it reaches the request cap and the
+     * model is still thinking we emit the think_end_id here to release it
+     * into the body.  Closed once the cap is forced or the model emits a
+     * think_end_id of its own. */
+    int req_think_end_id = j->req.reasoning_budget_set ?
+        ds4_token_think_end(s->engine) : -1;
+    const bool reasoning_budget_enabled = j->req.reasoning_budget_set &&
+        j->req.reasoning_budget > 0 && req_think_end_id >= 0;
+    int reasoning_tokens = 0;
+    bool reasoning_budget_closed = false;
+    bool forced_end_think = false;
+
+    /* Tone-mask state: active only while inside a think segment and the next
+     * generated token starts a new sentence.  Just 好 (853) is suppressed for
+     * now — no other words are touched. */
+    bool at_sentence_start = thinking.inside;
+    int tone_mask_ids[1] = { 853 };
+
+    /* Ring buffer of the most recently generated token ids, for repetition
+     * penalty applied at the sampling layer to break degeneration loops. */
+    enum { DS4_SERVER_REPEAT_HIST = 4096 };
+    int repeat_hist[DS4_SERVER_REPEAT_HIST];
+    int repeat_head = 0;
+    int repeat_count = 0;
+    int repeat_mod = DS4_SERVER_REPEAT_HIST;
+
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
@@ -13813,6 +13936,24 @@ decode_again:
         if (greedy_tool_syntax) {
             temperature = 0.0f;
         }
+        ds4_tone_mask_set(at_sentence_start && thinking.inside ? tone_mask_ids : NULL,
+                          at_sentence_start && thinking.inside ? 1 : 0);
+        /* Repetition penalty: given the recent window, any token that already
+         * appeared there more than once is a repetition candidate and is
+         * excluded from every sampling path (greedy, top-p, speculative verify)
+         * so a degenerate loop cannot feed itself. */
+        {
+            int n = repeat_count < repeat_mod ? repeat_count : repeat_mod;
+            int start = (repeat_head - n + repeat_mod) % repeat_mod;
+            int hist[256];
+            int hn = n < 256 ? n : 256;
+            for (int i = 0; i < hn; i++) hist[i] = repeat_hist[(start + i) % repeat_mod];
+            ds4_repeat_set(hist, hn, hn, 0.f);
+            ds4_repeat_apply_freq(ds4_engine_vocab_size(s->engine));
+        }
+        /* Apply tone-mask in-place on the session logits before sampling:
+         * zeroing the probability of masked ids after the fact is defeated by
+         * the candidate rebuild, so pin their logits to -inf here instead. */
         const int eos_token = ds4_token_eos(s->engine);
         int token = j->req.ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session,
@@ -13831,6 +13972,199 @@ decode_again:
             stop_detail = "stop token";
             stop_token = token;
             break;
+        }
+        /* Per-request reasoning budget: once we are still inside a thinking
+         * segment and the cap has been reached, force one think_end_id to
+         * release the model into the body.  Mirrors the forced override in
+         * ds4_generate_raw_swa_cpu (reasoning_tokens >= budget -> emit
+         * think_end_id exactly once).  Speculation is disabled for this step
+         * so the forced think_end_id is not expanded into body text. */
+        if (reasoning_budget_enabled && !reasoning_budget_closed &&
+            thinking.inside && !forced_end_think &&
+            reasoning_tokens >= j->req.reasoning_budget) {
+            token = req_think_end_id;
+            forced_end_think = true;
+        }
+        if (forced_end_think) {
+            int toks[17];
+            int ntok = 0;
+            const int block_start = ds4_session_pos(slot->session);
+            const bool use_speculation = false;
+            if (!s->batched_mode &&
+                !(thinking.inside &&
+                  ds4_session_ds41_dspark_adaptive_stats(slot->session, NULL, NULL)) &&
+                ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            {
+                if (j->req.ignore_eos) {
+                    ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
+                        slot->session, token, max_tokens - completion,
+                        eos_token, j->req.think_mode,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                } else {
+                    ntok = ds4_session_eval_speculative(
+                        slot->session, token, max_tokens - completion,
+                        eos_token, temperature, top_k, top_p, min_p, &rng,
+                        toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                        err, sizeof(err));
+                }
+                if (ntok < 0) {
+                    finish = "error";
+                    break;
+                }
+            } else {
+                if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+                    finish = "error";
+                    break;
+                }
+                toks[0] = token;
+                ntok = 1;
+            }
+            if (ntok == 0) {
+                finish = "error";
+                snprintf(err, sizeof(err), "decode returned no tokens");
+                break;
+            }
+            bool stop_decode = false;
+            bool resample = false;
+            bool text_stop = false;
+            int kept = 0;
+            for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
+                if (job_cancelled(j)) {
+                    stop_decode = true;
+                    break;
+                }
+                token = toks[ti];
+                if (ds4_token_is_stop_for_think_mode(s->engine,
+                                                     token,
+                                                     j->req.think_mode)) {
+                    finish = "stop";
+                    stop_detail = "stop token";
+                    stop_token = token;
+                    stop_decode = true;
+                    break;
+                }
+
+                size_t piece_len = 0;
+                char *piece = ds4_token_text(s->engine, token, &piece_len);
+                completion++;
+                kept++;
+
+                trace_piece(s, trace_id, piece, piece_len);
+                buf_append(&text, piece, piece_len);
+                const bool was_thinking = thinking.inside;
+                if (!dsml_decode_state_is_tool(dsml_tracker.decode))
+                    thinking_state_feed(&thinking, piece, piece_len);
+                /* update sentence-boundary state for next iteration */
+                at_sentence_start = tone_mask_piece_begins_sentence(piece, piece_len);
+                /* record token in repetition-penalty ring buffer */
+                repeat_hist[repeat_head] = token;
+                repeat_head = (repeat_head + 1) % repeat_mod;
+                if (repeat_count < repeat_mod) repeat_count++;
+
+                if (reasoning_budget_enabled && !reasoning_budget_closed) {
+                    reasoning_tokens++;
+                }
+                if (token == req_think_end_id) {
+                    reasoning_budget_closed = true;
+                }
+
+                size_t stop_pos = 0, stop_len = 0;
+                bool hit_stop = stop_list_find_from(&j->req.stops, text.ptr,
+                                                    stop_scan_from,
+                                                    &stop_pos, &stop_len);
+                size_t stream_len = hit_stop ?
+                    stop_pos : stop_list_stream_safe_len(&j->req.stops, text.len);
+                if (stream_len > text.len) stream_len = text.len;
+                stream_len = utf8_stream_safe_len(text.ptr, plain_stream_pos,
+                                                  stream_len, hit_stop);
+                if (!hit_stop && j->req.stops.max_len > 1) {
+                    const size_t hold = j->req.stops.max_len - 1;
+                    stop_scan_from = text.len > hold ? text.len - hold : 0;
+                }
+
+                if (j->req.stream && !structured_stream && stream_len > plain_stream_pos) {
+                    char *delta = xstrndup(text.ptr + plain_stream_pos,
+                                           stream_len - plain_stream_pos);
+                    bool ok = sse_chunk(j->fd, &j->req, id, delta, NULL);
+                    free(delta);
+                    if (!ok) {
+                        job_mark_cancelled(j);
+                        finish = "error";
+                        snprintf(err, sizeof(err), "client stream write failed");
+                        free(piece);
+                        stop_decode = true;
+                        break;
+                    }
+                    plain_stream_pos = stream_len;
+                }
+                if (j->req.stream && j->req.api == API_ANTHROPIC &&
+                    !anthropic_sse_stream_update(j->fd, s, &j->req, id,
+                                                 &anthropic_live, text.ptr, stream_len,
+                                                 false)) {
+                    job_mark_cancelled(j);
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                if (openai_live_chat &&
+                    !openai_sse_stream_update(j->fd, s, &j->req, id,
+                                              &openai_live, text.ptr, stream_len,
+                                              false)) {
+                    job_mark_cancelled(j);
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+                if (responses_live_chat &&
+                    !responses_sse_stream_update(j->fd, &j->req,
+                                                 &responses_live, text.ptr, stream_len,
+                                                 false)) {
+                    job_mark_cancelled(j);
+                    finish = "error";
+                    snprintf(err, sizeof(err), "client stream write failed");
+                    free(piece);
+                    stop_decode = true;
+                    break;
+                }
+
+                if (j->req.ignore_eos && ds4_token_is_stop(eos_token ? NULL : s->engine, token)) {
+                    /* EOS reached via ignore_eos path (defensive). */
+                }
+
+                if (j->req.kind == REQ_CHAT && j->req.has_tools && saw_tool_end) {
+                    finish = "tool_calls";
+                    stop_decode = true;
+                    break;
+                }
+                const bool next_greedy = !thinking.inside &&
+                    dsml_decode_state_is_tool(dsml_tracker.decode) &&
+                    !dsml_decode_state_uses_payload_sampling(dsml_tracker.decode);
+                if (ti + 1 < ntok && ds4_engine_mtp_exact_sampling(s->engine) &&
+                    payload_temperature > 0.0f &&
+                    next_greedy != greedy_tool_syntax) {
+                    resample = true;
+                    break;
+                }
+            }
+            if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
+                int pos = block_start + kept - (resample ? 1 : 0);
+                pthread_mutex_lock(&s->inference_mu);
+                const bool restored = ds4_session_rewind_speculative(slot->session, block_start + kept);
+                pthread_mutex_unlock(&s->inference_mu);
+                if (!restored && (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+                    (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0))) {
+                    finish = "error";
+                    stop_decode = true;
+                }
+            }
+            if (stop_decode) break;
+            continue;
         }
 
         int toks[17];
@@ -13912,6 +14246,12 @@ decode_again:
             const bool was_thinking = thinking.inside;
             if (!dsml_decode_state_is_tool(dsml_tracker.decode))
                 thinking_state_feed(&thinking, piece, piece_len);
+            /* update sentence-boundary state for next iteration */
+            at_sentence_start = tone_mask_piece_begins_sentence(piece, piece_len);
+                /* record token in repetition-penalty ring buffer */
+                repeat_hist[repeat_head] = token;
+                repeat_head = (repeat_head + 1) % repeat_mod;
+                if (repeat_count < repeat_mod) repeat_count++;
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking.inside) {
                     dsml_decode_tracker_init(&dsml_tracker);
@@ -16452,7 +16792,7 @@ static void test_anthropic_live_stream_sends_incremental_blocks(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.has_tools = true;
     r.tool_orders = make_bash_order();
 
@@ -16511,7 +16851,7 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.has_tools = true;
 
     anthropic_stream st;
@@ -16683,7 +17023,7 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.has_tools = true;
     r.tool_orders = make_bash_order();
 
@@ -16741,7 +17081,7 @@ static void test_openai_stream_reroutes_second_reasoning_pass(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.has_tools = true;
 
     openai_stream st;
@@ -16868,7 +17208,7 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     request_init(&r, REQ_CHAT, 128);
     r.api = API_OPENAI;
     r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.has_tools = false;
 
     TEST_ASSERT(request_uses_structured_stream(&r));
@@ -17911,7 +18251,7 @@ static void test_qwen_thinking_visible_text_matches_render(void) {
         TEST_ASSERT(!strcmp(prompt_text + strlen(prompt_text) - strlen(gen), gen));
         request r;
         request_init(&r, REQ_CHAT, 128);
-        r.think_mode = DS4_THINK_HIGH;
+        r.think_mode = DS4_THINK_MEDIUM;
         r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
         r.prompt_text = xstrdup(prompt_text);
         char *visible = build_thinking_visible_text(&r, "The answer is 4.\n");
@@ -17965,7 +18305,7 @@ static void test_qwen_checkpoint_suffix_matches_render(void) {
     request r;
     request_init(&r, REQ_CHAT, 64);
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     chat_msgs msgs = {0};
     chat_msg user = {0};
     user.role = xstrdup("user");
@@ -18362,7 +18702,7 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.tool_orders = make_bash_order();
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
     const char *command = strstr(suffix, "name=\"command\"");
@@ -18674,7 +19014,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
 
 static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     request r = {0};
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.prompt_text = xstrdup(
         "<｜begin▁of▁sentence｜>"
         "## Tools\nschema\n\nSystem rule\n\n"
@@ -18698,7 +19038,7 @@ static void test_invalid_glm_tool_error_suffix(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     thinking_state st = {.inside = true};
 
     char *suffix = build_invalid_tool_call_error_suffix(&r, &st,
@@ -18763,7 +19103,7 @@ static void test_invalid_qwen_tool_error_suffix(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     thinking_state st = {.inside = true};
 
     char *suffix = build_invalid_tool_call_error_suffix(&r, &st, "missing function name");
@@ -18860,7 +19200,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -18933,7 +19273,7 @@ static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
 
@@ -19013,7 +19353,7 @@ static void test_tool_checkpoint_minifies_json_parameters(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -19172,7 +19512,7 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_ANTHROPIC;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
@@ -19360,7 +19700,7 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
 
     chat_msgs msgs = {0};
     chat_msg assistant = {0};
@@ -19508,7 +19848,7 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.api = API_RESPONSES;
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.reasoning_summary_emit = true;
 
     char *suffix = build_responses_visible_assistant_suffix(&r, "5",
@@ -20519,7 +20859,7 @@ static void test_cancel_withdraws_only_pending_decode(void) {
 static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.prompt_text = xstrdup("<｜Assistant｜><think>");
     thinking_state st = thinking_state_from_prompt(&r);
     TEST_ASSERT(st.inside == true);
@@ -20546,7 +20886,7 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     thinking_state st = {.inside = true};
 
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
@@ -21423,7 +21763,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
 
     request r;
     request_init(&r, REQ_CHAT, 128);
-    r.think_mode = DS4_THINK_HIGH;
+    r.think_mode = DS4_THINK_MEDIUM;
     r.prompt_text = xstrdup(prompt_text);
     char *visible = build_thinking_visible_text(&r, content);
     TEST_ASSERT(visible != NULL);
@@ -21753,7 +22093,7 @@ static void test_visible_image_key(void) {
     free(a);
     TEST_ASSERT(visible_prompt_key(&req, "marker missing", &next) == NULL);
 
-    request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_HIGH,
+    request glm = {.model_syntax = SERVER_MODEL_SYNTAX_GLM, .think_mode = DS4_THINK_MEDIUM,
                    .prompt_text = "<|user|>hello<|assistant|><think>"};
     char *visible = build_thinking_visible_text(&glm, " hello ");
     TEST_ASSERT(!strcmp(visible, "<|user|>hello<|assistant|><think></think>hello"));
@@ -21892,7 +22232,7 @@ static void test_deepseek41_server_stream(void) {
         r.api = API_OPENAI;
         r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
         r.stream = r.has_tools = true;
-        r.think_mode = DS4_THINK_HIGH;
+        r.think_mode = DS4_THINK_MEDIUM;
         openai_stream st;
         openai_stream_start(&r, &st);
         char *partial = xstrndup(raw, split);
@@ -21928,6 +22268,34 @@ static void test_deepseek41_server_stream(void) {
         close(sv[0]); close(sv[1]);
         if (!complete) break;
     }
+}
+
+static void test_ds41_effort_line_absent(void) {
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("Hi");
+    chat_msgs_push(&msgs, u);
+    const ds4_think_mode modes[] = {DS4_THINK_LOW, DS4_THINK_MEDIUM, DS4_THINK_HIGH, DS4_THINK_MAX};
+    for (size_t k = 0; k < sizeof(modes)/sizeof(modes[0]); k++) {
+        char *p = render_deepseek41_chat(&msgs, 0, NULL, modes[k], false);
+        TEST_ASSERT(p && !strstr(p, "Reasoning Effort"));
+        TEST_ASSERT(p && !strncmp(p, "<｜begin▁of▁sentence｜><｜User｜>", strlen("<｜begin▁of▁sentence｜><｜User｜>")));
+        free(p);
+    }
+    /* live_tail continuation must be byte-identical to the full render's tail */
+    chat_msg a = {0};
+    a.role = xstrdup("assistant");
+    a.content = xstrdup("ok");
+    chat_msgs_push(&msgs, a);
+    char *full = render_deepseek41_chat(&msgs, 0, NULL, DS4_THINK_HIGH, false);
+    const char *boundary = strstr(full, "<｜end▁of▁sentence｜>");
+    TEST_ASSERT(boundary);
+    char *tail = render_deepseek41_chat(&msgs, 2, NULL, DS4_THINK_HIGH, true);
+    TEST_ASSERT(!strcmp(boundary, tail));
+    free(full);
+    free(tail);
+    chat_msgs_free(&msgs);
 }
 
 static void test_deepseek41_server_tools(void) {
@@ -22019,7 +22387,7 @@ static void test_deepseek41_live_result_order(void) {
         request_init(&r, REQ_CHAT, 128);
         r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK41;
         r.api = anthropic ? API_ANTHROPIC : API_RESPONSES;
-        r.think_mode = DS4_THINK_HIGH;
+        r.think_mode = DS4_THINK_MEDIUM;
         live_tool_state *live = anthropic ? &slot.anthropic_live : &slot.responses_live;
         live->valid = true;
         id_list_push_unique(&live->call_ids, "a");
@@ -22051,6 +22419,7 @@ static void test_deepseek41_live_result_order(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_deepseek41_server_stream();
+    test_ds41_effort_line_absent();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();

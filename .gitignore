@@ -100,3 +100,11 @@ __pycache__/
 /tests/test_v41_router_hier
 /tests/test_v41_spec_rewind
 /tests/test_ds41_dspark_adaptive
+
+# 本机引擎历次调参备份（tone/repeat/effort/预算...）不入仓库
+ds4-server.bak-*
+ds4-server.prev
+ds4.c.bak-*
+ds4.h.bak-*
+ds4_server.c.bak-*
+tests/test_prompt_prefix
