@@ -1224,7 +1224,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
-    if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
+    if (ds4_engine_is_deepseek41(engine)) return "deepseek-v41-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
@@ -1236,6 +1236,7 @@ static bool server_model_alias_known(const char *id) {
     return id &&
            (!strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
+            !strcmp(id, "deepseek-v41-flash") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
             !strcmp(id, "qwen3.8-flash-next-no-think") ||
